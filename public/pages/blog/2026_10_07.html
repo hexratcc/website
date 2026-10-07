@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<link rel="icon" href="../../favicon.ico" type="image/x-icon">
+	<link rel="stylesheet" href="../../style.css">
+	<title>rat's register allocator</title>
+</head>
+
+<body>
+	<header>
+		<a href="../../index.html">home</a>
+		<a href="../blog.html">blog</a>
+		<a href="../showcase.html">show</a>
+		<a href="../homelab.html">lab</a>
+		<a href="../favourites.html">fav</a>
+		<a href="../resources.html">res</a>
+		<a href="../ideas.html">ideas</a>
+		<a href="../tools.html">tools</a>
+	</header>
+	<div class="blog-content">
+		<h1>rat's register allocator</h1>
+		<div class="blog-date">October 7th, 2026</div>
+		<div>
+			<a href="https://github.com/hexratcc/rat" target="_blank">rat</a> is my smallish compiler backend (with a semi-working
+			C99 frontend). Its x86-64 code generator
+			translates the <a href="https://en.wikipedia.org/wiki/Intermediate_representation" target="_blank">intermediate
+				representation</a> (IR) into x86-64 instructions. These use an unlimited number of virtual
+			registers (vregs). The register allocator maps each vreg to a physical register: a general-purpose register (12 can
+			be used) or an xmm register (14 on Linux<sup><a href="#fn1" id="ref1">1</a></sup>). When no register is free,
+			it maps the vreg to a stack slot.
+		</div>
+		<div>
+			For a long time rat used a <a href="https://dl.acm.org/doi/10.1145/330249.330250" target="_blank">linear
+				scan</a> allocator, which visits live ranges in program order. It worked, but it grew one fix at a time, to
+			1392 lines. So I measured which of its parts helped, threw the rest away and wrote a priority bin-packing
+			allocator in 584 lines. It visits live ranges by importance and puts each one in the first register where it
+			fits. It is the same family as LLVM's
+			<a href="https://blog.llvm.org/2011/09/greedy-register-allocation-in-llvm-30.html" target="_blank">greedy
+				allocator</a>, minus most of the hard parts, and it makes
+				<a href="#numbers">better code</a>.
+		</div>
+		<!-- Values and calls -->
+		<div>
+			<div>
+				A value is <b>live</b> from where it is written to where it is last read. Two values can share a register
+				only if they are never live at the same time.
+			</div>
+			<div>
+				When too many values are live at one point, some go to memory: they are <b>spilled</b>. A spill
+				costs a store and a load. The best assignment is NP-hard to find<sup><a href="#fn2" id="ref2">2</a></sup>,
+				so all practical allocators use heuristics.
+			</div>
+			<div>
+				The <a href="https://en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI"
+					target="_blank">calling convention</a> adds two rules. A call can overwrite the <b>caller-saved</b> registers
+				(<code>rax rcx rdx rsi rdi r8-r11</code> and all xmm registers on Linux). A function must restore the
+				<b>callee-saved</b> registers (<code>rbx rbp r12-r15</code>) before it returns. As an example, this
+				function keeps <code>y</code> live across a call:
+			</div>
+			<pre><code class="hcj language-cpp"><span class="hcj-type">long</span> <span class="hcj-title">g</span>(<span class="hcj-type">long</span>);
+<span class="hcj-type">long</span> <span class="hcj-title">h</span>(<span class="hcj-type">long</span> x, <span class="hcj-type">long</span> y) {
+	<span class="hcj-type">long</span> t = g(x);
+	<span class="hcj-keyword">return</span> t + y;
+}</code></pre>
+		</div>
+		<!-- Before and after -->
+		<div>
+			<div>
+				Before allocation, <code>rdi</code>, <code>rsi</code> and <code>rax</code> are fixed by the calling
+				convention, and <code>v1</code>-<code>v4</code> are vregs:
+			</div>
+			<pre><code class="hcj">0  v1 = copy rdi      <span class="hcj-comment">; x</span>
+1  v2 = copy rsi      <span class="hcj-comment">; y</span>
+2  rdi = copy v1      <span class="hcj-comment">; argument of g</span>
+3  call g             <span class="hcj-comment">; clobbers caller-saved</span>
+4  v3 = copy rax      <span class="hcj-comment">; t</span>
+5  v4 = copy v3
+6  v4 = add v4, v2
+7  rax = copy v4
+8  ret</code></pre>
+			<div>
+				x86 <code>add</code> writes over its first operand (two-address), so instruction 5 copies <code>t</code>
+				first. After allocation, at -O1:
+			</div>
+			<pre><code class="hcj">push rbp
+mov  rbp, rsp
+sub  rsp, 0x8
+push rbx              <span class="hcj-comment">; rbx is callee-saved: save it</span>
+mov  rbx, rsi         <span class="hcj-comment">; y</span>
+call g                <span class="hcj-comment">; x is already in rdi</span>
+add  rax, rbx         <span class="hcj-comment">; t stays in rax</span>
+pop  rbx
+leave
+ret</code></pre>
+			<div>
+				Five of the six copies are gone, and <code>y</code> went to a callee-saved register. No code in the
+				allocator says "put values that cross a call in callee-saved registers". It falls out of the design, and
+				that is my favourite part.
+			</div>
+		</div>
+		<!-- Five steps -->
+		<div>
+			<h3 id="five-steps">Five steps</h3>
+			<div>
+				The allocator runs five steps per function:
+			</div>
+			<ol>
+				<li><a href="#live-ranges">Live ranges</a>: number the instructions and find where each vreg is live.</li>
+				<li><a href="#fixed-registers">Fixed registers</a>: mark where the code uses physical registers
+					directly.</li>
+				<li><a href="#coalescing">Coalescing</a>: join vregs that a copy connects into one group (a
+					<b>bundle</b><sup><a href="#fn3" id="ref3">3</a></sup>), so the copy can go away.</li>
+				<li><a href="#picking-registers">Picking registers</a>: give each bundle a register, most important
+					first.</li>
+				<li><a href="#spilling">Spilling</a>: give stack slots to bundles with no register, then
+					rewrite the code.</li>
+			</ol>
+			<div>
+				Each bundle keeps its register or stack slot for its full lifetime. The allocator never:
+			</div>
+			<ul>
+				<li>takes a register back from a bundle (no eviction)</li>
+				<li><a href="https://en.wikipedia.org/wiki/Register_allocation#Split_allocation"
+					target="_blank">splits</a> a range between a register and memory</li>
+				<li>runs a step two times</li>
+			</ul>
+			<div>
+				These parts make real allocators big. My <a href="#numbers">measurements</a> say rat does
+				not miss them much.
+			</div>
+		</div>
+		<!-- Live ranges -->
+		<div>
+			<h3 id="live-ranges">Live ranges</h3>
+			<h4 id="slots">Slots</h4>
+			<div>
+				Instruction <code>i</code> gets two slots: it reads its operands at <code>2i</code> and writes its results
+				at <code>2i+1</code>. A live range is a sorted list of <code>[start, end]</code> slot segments.
+			</div>
+			<div>
+				Where a source ends depends on the instruction:
+			</div>
+			<ul>
+				<li><b>Copies:</b> the source ends at the read slot, and the destination starts at the write
+					slot. In instruction 2, <code>rdi = copy v1</code>, <code>v1</code> ends at slot
+					4 and <code>rdi</code> starts at slot 5. They do not
+					overlap, so they can share a register and the copy becomes a no-op.</li>
+				<li><b>Other instructions:</b> a source stays live through the write slot, so a result never overwrites a
+					different operand. <code>v2</code> is written by instruction 1 and last read by the
+					<code>add</code> at instruction 6, so it lives in <code>[3, 13]</code>.</li>
+			</ul>
+			<h4 id="live-out">Live-out sets</h4>
+			<div>
+				rat finds the vregs that are <b>live-out</b> of each block: a later block can still read them. Many
+				compilers do this with one bitset per block and a
+				<a href="https://en.wikipedia.org/wiki/Live-variable_analysis" target="_blank">fixed-point loop</a>. rat does
+				one vreg at a time instead:
+			</div>
+			<ol>
+				<li>The vreg is live into each block that reads it before it writes it.</li>
+				<li>From each such block, a worklist goes back through the predecessors and marks the vreg live-out in
+					each.</li>
+				<li>The walk stops at a block that defines the vreg.</li>
+			</ol>
+			<div>
+				The cost grows with the blocks where each vreg is live, not with
+				<code>blocks * vregs</code>.<sup><a href="#fn4" id="ref4">4</a></sup>
+			</div>
+			<h4 id="weights">Segments and weights</h4>
+			<div>
+				Then rat walks each block backward from its live-out set and makes the segments. The same walk sums a
+				<b>weight</b> per vreg: the cost of its spill.
+			</div>
+			<div>
+				Each def and each use adds <code>3<sup>d</sup></code>, where <code>d</code> is the loop depth (up to 11):
+			</div>
+			<table>
+				<tr>
+					<th>def or use in</th>
+					<th>adds</th>
+				</tr>
+				<tr>
+					<td>straight-line code</td>
+					<td>1</td>
+				</tr>
+				<tr>
+					<td>a loop</td>
+					<td>3</td>
+				</tr>
+				<tr>
+					<td>a doubly nested loop</td>
+					<td>9</td>
+				</tr>
+			</table>
+			<h4 id="holes">Holes</h4>
+			<div>
+				A live range can have <b>holes</b>, gaps where the vreg is dead. Blocks are numbered in code order, so a range
+				that skips a block has a hole there:
+			</div>
+			<pre><code class="hcj language-cpp"><span class="hcj-type">long</span> <span class="hcj-title">f</span>(<span class="hcj-type">long</span>* a, <span class="hcj-type">long</span> n) {
+	<span class="hcj-keyword">for</span>(<span class="hcj-type">long</span> i = 0; i &lt; n; ++i)
+		<span class="hcj-keyword">if</span>(a[i] &lt; 0)
+			a[i] = 0;
+	<span class="hcj-keyword">return</span> n * 3;
+}</code></pre>
+			<div>
+				The exit block sits between the loop blocks:
+			</div>
+			<pre><code class="hcj">mov  eax, 0x0         <span class="hcj-comment">; offset 8*i, rax in the loop</span>
+cmp  rdx, rdi
+jl   loop
+exit:
+lea  rax, [rdi+rdi*2] <span class="hcj-comment">; n*3 in the hole of rax</span>
+ret
+loop:
+mov  rcx, r8
+add  rcx, rax
+...
+add  rax, 0x8
+cmp  rdx, rdi
+jl   loop
+jmp  exit</code></pre>
+			<div>
+				The offset in <code>rax</code> is dead in the exit block, so <code>n*3</code> (one
+				<a href="https://www.felixcloutier.com/x86/lea" target="_blank"><code>lea</code></a>) can use <code>rax</code>,
+				which is also the return register. A free win from block order.
+			</div>
+		</div>
+		<!-- Fixed registers -->
+		<div>
+			<h3 id="fixed-registers">Fixed registers</h3>
+			<div>
+				rat numbers its registers 1 to 40, so one <code>U64</code> holds a set of them. Each slot gets one mask,
+				<code>busy[slot]</code>. A set bit means that register is busy at that slot.
+			</div>
+			<div>
+				The same backward walk marks the physical registers the code uses directly:
+			</div>
+			<table>
+				<tr>
+					<th>use</th>
+					<th>register</th>
+					<th>busy</th>
+				</tr>
+				<tr>
+					<td>incoming argument</td>
+					<td>argument register</td>
+					<td>until the copy that reads it</td>
+				</tr>
+				<tr>
+					<td>call argument</td>
+					<td>argument register</td>
+					<td>from the copy that sets it to the call</td>
+				</tr>
+				<tr>
+					<td>call</td>
+					<td>all caller-saved</td>
+					<td>in the two slots of the call</td>
+				</tr>
+				<tr>
+					<td>return value</td>
+					<td><code>rax</code></td>
+					<td>from the call to the copy that reads it</td>
+				</tr>
+				<tr>
+					<td><a href="https://www.felixcloutier.com/x86/idiv" target="_blank">division</a></td>
+					<td><code>rax rcx rdx</code></td>
+					<td>reads <code>rax rcx</code>, writes <code>rax rdx</code></td>
+				</tr>
+			</table>
+			<div>
+				The masks and ranges of <code>h</code>:
+			</div>
+			<pre><code class="hcj">instr   0  1  2  3  4  5  6  7  8
+slot    rw rw rw rw rw rw rw rw rw
+rdi     #. .. .#### .. .. .. .. ..
+rsi     ####. .. ## .. .. .. .. ..
+rax     .. .. .. ####. .. .. .####
+others  .. .. .. ## .. .. .. .. ..
+v1 x    .======. .. .. .. .. .. ..
+v2 y    .. .================ .. ..
+v3+v4 t .. .. .. .. .=========. ..</code></pre>
+			<div>
+				<code>r</code> and <code>w</code> are the read and write slots. <code>#</code> is busy, <code>=</code> is a
+					live range and <code>.</code> is free. A bar continues across the gap between instructions. "others" is
+					every other caller-saved register.
+			</div>
+			<div>
+				When a bundle gets a register, rat sets that register's bit in every slot of its live range. After that,
+				vregs and fixed registers are bits in the same masks. Each group of 64 slots also has a summary mask, the
+				OR of its 64 masks, so a long range can skip 64 slots at a time.
+			</div>
+		</div>
+		<!-- Coalescing -->
+		<div>
+			<h3 id="coalescing">Coalescing</h3>
+			<div>
+				A copy between two vregs of the same class is a candidate for
+				<a href="https://en.wikipedia.org/wiki/Register_allocation#Coalescing" target="_blank">coalescing</a>. These
+				copies come from:
+			</div>
+			<ul>
+				<li>two-address instructions</li>
+				<li><a href="https://en.wikipedia.org/wiki/Static_single-assignment_form" target="_blank">phi nodes</a>: a
+					value that comes from different blocks at a join point</li>
+			</ul>
+			<div>
+				If the two live ranges do not overlap, the vregs become one bundle. It has the merged segments and the summed
+				weight. rat deletes a copy inside one bundle. In
+				<code>h</code>, <code>v3</code> is <code>[9, 10]</code> and <code>v4</code> is <code>[11, 14]</code>, so
+				they merge.
+			</div>
+			<ul>
+				<li>rat sorts the copies by loop depth, deepest first. Hot copies merge before cold copies can block them.</li>
+				<li>The bundles are kept in a <a href="https://en.wikipedia.org/wiki/Disjoint-set_data_structure"
+						target="_blank">union-find</a>.</li>
+				<li>A merge first walks both segment lists to check for overlap. rat skips a merge when the two bundles
+					together have more than 256 segments.</li>
+			</ul>
+			<div>
+				A copy between a vreg and a physical register sets a <b>hint</b> instead: the bundle prefers that register
+				if it is free.
+			</div>
+		</div>
+		<!-- Picking registers -->
+		<div>
+			<h3 id="picking-registers">Picking registers</h3>
+			<div>
+				Each bundle gets a priority:
+			</div>
+			<pre><code class="hcj">priority = weight / sqrt(length in slots)</code></pre>
+			<ul>
+				<li>Short, hot ranges come first: they matter most and are the easiest to place.</li>
+				<li>Long, cold ranges come last and get spilled.</li>
+				<li><code>sqrt</code> keeps a long loop counter from losing too much priority.</li>
+			</ul>
+			<div>
+				rat calls <code>pick</code> on each bundle in priority order:
+			</div>
+			<pre><code class="hcj language-cpp"><span class="hcj-comment">// cls: register class, gp or xmm</span>
+<span class="hcj-type">PhysReg</span> <span class="hcj-title">pick</span>(<span class="hcj-type">VReg</span> v) {
+	<span class="hcj-type">U64</span> blocked = ~allocatable[cls];
+	<span class="hcj-keyword">for</span>(<span class="hcj-keyword">auto</span> [start, end] : segs[v])
+		<span class="hcj-keyword">for</span>(<span class="hcj-type">I32</span> s = start; s &lt;= end; ++s)
+			blocked |= busy[s]; <span class="hcj-comment">// or 64 at a time</span>
+	<span class="hcj-keyword">if</span>(hint[v] != kNoReg &amp;&amp; !(blocked &gt;&gt; hint[v] &amp; 1))
+		<span class="hcj-keyword">return</span> hint[v];
+	<span class="hcj-comment">// caller-saved first, callee-saved last</span>
+	<span class="hcj-keyword">return</span> firstFree(order[cls], blocked);
+}</code></pre>
+			<h4 id="picking-in-h">Picking in <code>h</code></h4>
+			<table>
+				<tr>
+					<th>bundle</th>
+					<th>hint</th>
+					<th>gets</th>
+				</tr>
+				<tr>
+					<td><code>v1</code></td>
+					<td><code>rdi</code></td>
+					<td><code>rdi</code></td>
+				</tr>
+				<tr>
+					<td><code>v3+v4</code></td>
+					<td><code>rax</code></td>
+					<td><code>rax</code></td>
+				</tr>
+				<tr>
+					<td><code>v2</code></td>
+					<td><code>rsi</code></td>
+					<td><code>rbx</code></td>
+				</tr>
+			</table>
+			<div>
+				In the diagram, <code>rdi</code> is busy only before and after <code>v1</code>, so <code>v1</code> gets it.
+				Both copies become <code>mov rdi, rdi</code>, and the
+				<a href="https://en.wikipedia.org/wiki/Peephole_optimization" target="_blank">peephole pass</a> deletes them after
+				allocation.
+			</div>
+			<div>
+				<code>v2</code> crosses the call. Every caller-saved register is busy in the call slots, so the first free
+				register is <code>rbx</code>, the first callee-saved one. The prologue saves
+				only the callee-saved registers rat used.
+			</div>
+			<div>
+				On Linux, no xmm register is callee-saved, so a float that crosses a call always goes to
+				the stack.
+			</div>
+		</div>
+		<!-- Spilling -->
+		<div>
+			<h3 id="spilling">Spilling</h3>
+			<div>
+				A bundle with no free register is spilled for its full lifetime. Then:
+			</div>
+			<ol>
+				<li>rat sorts the spilled bundles by start. It reuses a stack slot when the last bundle in it has ended.</li>
+				<li>rat rewrites the code. A vreg whose bundle got a register becomes that register.</li>
+				<li>Before each instruction, rat loads each spilled operand into a temporary register. After it, rat stores
+					each spilled result.</li>
+			</ol>
+			<div>
+				The temporary is <code>r10</code> or <code>r11</code> (<code>xmm14</code> or <code>xmm15</code> for floats).
+				No bundle ever gets these. If both are busy, rat takes the first register free at that
+				instruction.
+			</div>
+			<div>
+				Two cases need no temporary. A copy between a register and a spilled bundle becomes the load or the store
+				itself. A call reads a spilled stack argument from its stack slot directly.
+			</div>
+			<div>
+				In <code>p</code>, 14 values are live at once:
+			</div>
+			<pre><code class="hcj language-cpp"><span class="hcj-type">void</span> <span class="hcj-title">p</span>(<span class="hcj-type">long</span>* a) {
+	<span class="hcj-type">long</span> x0 = a[0], x1 = a[1], ..., x13 = a[13];
+	a[0] = x0 * x13; a[1] = x1 * x12; a[2] = x2 * x11;
+	a[3] = x3 * x10; a[4] = x4 * x9;  a[5] = x5 * x8;
+	a[6] = x6 * x7;
+}</code></pre>
+			<div>
+				16 registers minus <code>rsp</code>, <code>rbp</code>, <code>r10</code>, <code>r11</code> and
+				<code>rdi</code> (which holds <code>a</code>) leaves 11 for 14 values. <code>x0</code>-<code>x6</code> also
+				hold the products (two-address
+				<a href="https://www.felixcloutier.com/x86/imul" target="_blank"><code>imul</code></a>), so they have more
+				uses. Of <code>x7</code>-<code>x13</code>, the three with the longest ranges go to the stack.
+			</div>
+			<div>
+				Before the peephole pass:
+			</div>
+			<pre><code class="hcj">mov  r12, [rdi+0x30]  <span class="hcj-comment">; x6, in a register</span>
+mov  r10, [rdi+0x38]  <span class="hcj-comment">; x7, spilled</span>
+mov  [rbp-0x8], r10
+mov  r10, [rdi+0x40]  <span class="hcj-comment">; x8, spilled</span>
+mov  [rbp-0x10], r10
+mov  r10, [rdi+0x48]  <span class="hcj-comment">; x9, spilled</span>
+mov  [rbp-0x18], r10
+...
+mov  r10, [rbp-0x18]  <span class="hcj-comment">; reload x9</span>
+imul r9, r10
+mov  r10, [rbp-0x10]  <span class="hcj-comment">; reload x8</span>
+imul rbx, r10
+mov  r10, [rbp-0x8]   <span class="hcj-comment">; reload x7</span>
+imul r12, r10</code></pre>
+			<div>
+				No instruction between the store of <code>x9</code> and its reload writes <code>r10</code>. So the peephole
+				pass deletes the reload. Then nothing reads that stack slot, so it also deletes the store.
+			</div>
+		</div>
+		<!-- It can be dumb -->
+		<div>
+			<h3 id="it-can-be-dumb">It can be dumb</h3>
+			<div>
+				Without eviction, an early decision is final. Here is the case that annoys me most:
+			</div>
+			<pre><code class="hcj language-cpp"><span class="hcj-type">long</span> <span class="hcj-title">sum</span>(<span class="hcj-type">long</span>* a, <span class="hcj-type">long</span> n) {
+	<span class="hcj-type">long</span> s = 0;
+	<span class="hcj-keyword">for</span>(<span class="hcj-type">long</span> i = 0; i &lt; n; ++i)
+		s += a[i];
+	<span class="hcj-keyword">return</span> s;
+}</code></pre>
+			<div>
+				rat compiles it to:
+			</div>
+			<pre><code class="hcj">mov  r9, rdi          <span class="hcj-comment">; a: rdi was taken by a[i]</span>
+mov  r8, rsi          <span class="hcj-comment">; n: rsi was taken by s</span>
+...
+exit:
+mov  rax, rsi         <span class="hcj-comment">; s: rax was taken by a+8*i</span>
+ret
+loop:
+mov  rax, r9
+add  rax, rcx         <span class="hcj-comment">; rax = a + 8*i</span>
+mov  rdi, [rax]       <span class="hcj-comment">; rdi = a[i]</span>
+add  rsi, rdi
+...</code></pre>
+			<div>
+				The loop values are short and hot, so they go first:
+			</div>
+			<ol>
+				<li>The address <code>a+8*i</code> takes <code>rax</code>.</li>
+				<li><code>s</code> loses its hint <code>rax</code> and takes <code>rsi</code>.</li>
+				<li><code>a[i]</code> takes <code>rdi</code>.</li>
+				<li><code>a</code> and <code>n</code> come last and lose their hints too.</li>
+			</ol>
+			<div>
+				The result is three movs, all outside the loop.<sup><a href="#fn5" id="ref5">5</a></sup> An allocator with
+				eviction would fix this chain. I decided three cold movs are not worth the extra code.
+			</div>
+		</div>
+		<!-- Numbers -->
+		<div>
+			<h3 id="numbers">Numbers</h3>
+			<div>
+				Against the old allocator:
+			</div>
+			<table>
+				<tr>
+					<th>metric</th>
+					<th>change</th>
+				</tr>
+				<tr>
+					<td>allocator source</td>
+					<td>-58%</td>
+				</tr>
+				<tr>
+					<td>instructions emitted</td>
+					<td>-3.6%</td>
+				</tr>
+				<tr>
+					<td>stores emitted</td>
+					<td>-22%</td>
+				</tr>
+				<tr>
+					<td>allocator time, <a href="https://www.sqlite.org/amalgamation.html" target="_blank">sqlite</a> at -O0</td>
+					<td>-77%</td>
+				</tr>
+				<tr>
+					<td>total compile time, sqlite at -O0</td>
+					<td>-43%</td>
+				</tr>
+			</table>
+			<h4 id="feature-worth">What each feature was worth</h4>
+			<div>
+				Before the rewrite, I turned off each old feature in turn and measured the
+				code. This was the most useful hour of the project:
+			</div>
+			<table>
+				<tr>
+					<th>feature</th>
+					<th>instructions saved</th>
+					<th>new allocator</th>
+				</tr>
+				<tr>
+					<td>copy coalescing and copy hints</td>
+					<td>about a third</td>
+					<td>kept</td>
+				</tr>
+				<tr>
+					<td>live range holes</td>
+					<td>10%</td>
+					<td>kept</td>
+				</tr>
+				<tr>
+					<td>spill choice by use weight</td>
+					<td>5.5%</td>
+					<td>kept</td>
+				</tr>
+				<tr>
+					<td>hints to physical registers</td>
+					<td>1%</td>
+					<td>kept</td>
+				</tr>
+				<tr>
+					<td>optimistic second try at spilled ranges (37% of allocator time)</td>
+					<td>0.01%</td>
+					<td>dropped</td>
+				</tr>
+				<tr>
+					<td><a href="https://en.wikipedia.org/wiki/Rematerialization" target="_blank">rematerialization</a>
+						(recompute instead of reload)</td>
+					<td>not measurable</td>
+					<td>dropped</td>
+				</tr>
+				<tr>
+					<td>spill slot cache</td>
+					<td>not measurable</td>
+					<td>dropped</td>
+				</tr>
+			</table>
+		</div>
+		<!-- Wrapping up -->
+		<div>
+			<h3 id="wrapping-up">Wrapping up</h3>
+			<div>
+				No eviction, no splitting, no second pass, and the new allocator still beats the old one. Most of the
+				quality comes from cheap things: coalescing, hints, holes and use weights.
+			</div>
+			<div>
+				The lesson for me: measure the old code before I port it. Much of the old allocator did nothing.
+			</div>
+		</div>
+		<!-- References -->
+		<div>
+			<h3 id="references">References</h3>
+			<ul>
+				<li>Poletto and Sarkar, <a href="https://dl.acm.org/doi/10.1145/330249.330250" target="_blank">Linear scan
+						register allocation</a>: the base of the old allocator.</li>
+				<li>Max Bernstein, <a href="https://bernsteinbear.com/blog/linear-scan/" target="_blank">Linear scan register
+						allocation on SSA</a> and <a href="https://bernsteinbear.com/blog/linear-scan-lifetime-holes/"
+						target="_blank">Linear scan with lifetime holes</a>: a readable pair of posts.</li>
+				<li>Jakob Stoklund Olesen,
+					<a href="https://blog.llvm.org/2011/09/greedy-register-allocation-in-llvm-30.html" target="_blank">Greedy
+						register allocation in LLVM 3.0</a>: the big version of this idea, with eviction and splitting.</li>
+				<li>Chris Fallin, <a href="https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/" target="_blank">Cranelift,
+						part 4: a new register allocator</a>: a long, good read on bundles.</li>
+				<li>Matt Keeter, <a href="https://www.mattkeeter.com/blog/2022-10-04-ssra/" target="_blank">The solid-state
+						register allocator</a>: even smaller, it runs in one backward pass.</li>
+			</ul>
+		</div>
+		<!-- Notes -->
+		<div>
+			<h3 id="notes">Notes</h3>
+			<ol>
+				<li id="fn1">On Windows, only <code>xmm0</code>-<code>xmm3</code> can be used. <code>xmm4</code> and
+					<code>xmm5</code> are the spill temporaries, and rat does not use the callee-saved
+					<code>xmm6</code>-<code>xmm15</code>. <a href="#ref1">[back]</a></li>
+				<li id="fn2"><a href="https://en.wikipedia.org/wiki/Chaitin%27s_algorithm" target="_blank">Chaitin et al.</a>
+					showed that any graph can be the interference graph of some program. So register allocation is at least as
+					hard as graph coloring. <a href="#ref2">[back]</a></li>
+				<li id="fn3">Cranelift's <a href="https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/"
+						target="_blank">regalloc2</a> uses the same word for the same idea. <a href="#ref3">[back]</a></li>
+				<li id="fn4">Each block stores the last vreg that marked it, so the walk never clears a visited
+					array. <a href="#ref4">[back]</a></li>
+				<li id="fn5">The mov inside the loop, <code>mov rax, r9</code>, has a different
+					cause. It is the two-address copy for the add, and it always stays. <a href="#ref5">[back]</a></li>
+			</ol>
+		</div>
+	</div>
+
+</body>
+
+</html>
