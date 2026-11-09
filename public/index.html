@@ -5,6 +5,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<link rel="icon" href="./favicon.ico" type="image/x-icon">
 	<link rel="stylesheet" href="./style.css">
+	<link rel="preload" href="./api/activity" as="fetch" crossorigin>
 	<title>hexrat</title>
 </head>
 <body>
@@ -87,7 +88,7 @@
 			}
 
 			try {
-				const res = await fetch(`https://github-contributions-api.jogruber.de/v4/${username}?y=last`);
+				const res = await fetch('./api/activity');
 				const data = await res.json();
 				
 				const first_date = new Date(data.contributions[0].date);
